@@ -13,4 +13,4 @@ COPY . .
 EXPOSE 6689
 
 # Запуск
-CMD ["python", "app.py"]
+CMD ["python", "a.py"]
