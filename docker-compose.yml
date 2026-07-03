@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  sirius-auto-record:
+    build: .
+    container_name: sirius-auto-record
+    ports:
+      - "6689:6689"
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Moscow
+    volumes:
+      # Опционально: можно примонтировать директорию для сохранения логов
+      - ./logs:/app/logs
