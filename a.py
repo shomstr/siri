@@ -26,6 +26,16 @@ HEADERS = {
 
 MSK_TZ = timezone(timedelta(hours=3))
 
+# ==================== НАСТРОЙКИ СТРЕЛЬБЫ ====================
+# За сколько минут до recordStart начинать стрелять
+PRE_START_MINUTES = 2
+
+# Интервал между запросами (в секундах)
+SHOOT_INTERVAL_SECONDS = 10
+
+# Сколько секунд продолжать стрелять ПОСЛЕ recordStart
+POST_DURATION_SECONDS = 30
+
 # ==================== ХРАНИЛИЩЕ ====================
 class Store:
     def __init__(self):
@@ -81,7 +91,6 @@ def fetch_events():
     try:
         r = session.get(f"{BASE_URL}/record", timeout=15)
         
-        # Детальная обработка ошибок
         if r.status_code == 401:
             store.last_error = "❌ ОШИБКА 401: Токен истёк или невалидный. Обнови токен в настройках!"
             return False, store.last_error
@@ -92,14 +101,12 @@ def fetch_events():
             store.last_error = f"❌ HTTP {r.status_code}: {r.text[:200]}"
             return False, store.last_error
         
-        # Проверяем, что ответ JSON
         try:
             data = r.json()
         except Exception as e:
             store.last_error = f"❌ Ответ не JSON: {r.text[:200]}"
             return False, store.last_error
         
-        # Проверяем структуру ответа
         if 'success' not in data:
             store.last_error = f"❌ Нет поля 'success' в ответе. Ключи: {list(data.keys())}"
             return False, store.last_error
@@ -159,46 +166,91 @@ def subscribe_event(event_id):
         return False, 0, str(e)
 
 def auto_record_worker(task):
+    """
+    Рабочий поток для автозаписи.
+    Начинает стрелять за PRE_START_MINUTES до recordStart,
+    продолжает каждые SHOOT_INTERVAL_SECONDS секунд,
+    и ещё POST_DURATION_SECONDS секунд после recordStart.
+    """
     event_id = task['event_id']
     target = task['record_start']
     name = task['event_name']
-
+    
+    # Время начала стрельбы
+    shoot_start = target - timedelta(minutes=PRE_START_MINUTES)
+    # Время окончания стрельбы
+    shoot_end = target + timedelta(seconds=POST_DURATION_SECONDS)
+    
     with store.lock:
         for t in store.auto_tasks:
             if t['event_id'] == event_id and t['thread'] == threading.current_thread():
                 t['status'] = 'waiting'
-
+                t['shoot_start'] = shoot_start.strftime('%H:%M:%S')
+                t['shoot_end'] = shoot_end.strftime('%H:%M:%S')
+    
+    # Ждём до начала стрельбы
     while True:
         now = datetime.now(MSK_TZ)
-        delta = (target - now).total_seconds()
-        if delta > 1.0:
-            time.sleep(0.5)
-        else:
+        if now >= shoot_start:
             break
-
-    while datetime.now(MSK_TZ) < target:
-        pass
-
+        time.sleep(1)
+    
+    # Начинаем стрельбу
     with store.lock:
         for t in store.auto_tasks:
             if t['event_id'] == event_id and t['thread'] == threading.current_thread():
-                t['status'] = 'firing'
-                t['fire_time'] = datetime.now(MSK_TZ).strftime('%H:%M:%S.%f')
-
-    ok, code, resp = subscribe_event(event_id)
-
-    if not ok:
-        for retry in range(2):
-            time.sleep(0.1)
-            ok, code, resp = subscribe_event(event_id)
-            if ok:
-                break
-
+                t['status'] = 'shooting'
+                t['shots'] = []
+    
+    shot_count = 0
+    success = False
+    
+    # Стреляем циклом
+    while True:
+        now = datetime.now(MSK_TZ)
+        if now > shoot_end:
+            break
+        
+        # Делаем выстрел
+        shot_count += 1
+        timestamp = now.strftime('%H:%M:%S.%f')[:-3]
+        
+        ok, code, resp = subscribe_event(event_id)
+        
+        with store.lock:
+            for t in store.auto_tasks:
+                if t['event_id'] == event_id and t['thread'] == threading.current_thread():
+                    t['shots'].append({
+                        'time': timestamp,
+                        'ok': ok,
+                        'code': code,
+                    })
+                    if ok:
+                        success = True
+        
+        # Если успешно — останавливаемся
+        if success:
+            with store.lock:
+                for t in store.auto_tasks:
+                    if t['event_id'] == event_id and t['thread'] == threading.current_thread():
+                        t['status'] = 'success'
+            break
+        
+        # Ждём интервал перед следующим выстрелом
+        time.sleep(SHOOT_INTERVAL_SECONDS)
+    
+    # Финальный статус
     with store.lock:
         for t in store.auto_tasks:
             if t['event_id'] == event_id and t['thread'] == threading.current_thread():
-                t['status'] = 'done' if ok else 'failed'
-                t['result'] = {'ok': ok, 'code': code, 'response': resp}
+                if not success:
+                    t['status'] = 'failed'
+                t['total_shots'] = shot_count
+                t['result'] = {
+                    'ok': success,
+                    'shots': shot_count,
+                    'last_response': resp if not success else None
+                }
 
 # ==================== API ====================
 @app.route('/')
@@ -322,13 +374,24 @@ def api_auto_record():
             'result': None,
             'fire_time': None,
             'thread': None,
+            'shoot_start': None,
+            'shoot_end': None,
+            'shots': [],
+            'total_shots': 0,
         }
         t = threading.Thread(target=auto_record_worker, args=(task,), daemon=True)
         task['thread'] = t
         with store.lock:
             store.auto_tasks.append(task)
         t.start()
-        scheduled.append({'eventId': eid, 'name': ev.get('eventName'), 'recordStart': rs.strftime('%Y-%m-%d %H:%M:%S')})
+        
+        shoot_start = rs - timedelta(minutes=PRE_START_MINUTES)
+        scheduled.append({
+            'eventId': eid, 
+            'name': ev.get('eventName'), 
+            'recordStart': rs.strftime('%Y-%m-%d %H:%M:%S'),
+            'shootStart': shoot_start.strftime('%Y-%m-%d %H:%M:%S')
+        })
 
     return jsonify({'ok': True, 'scheduled': scheduled})
 
@@ -340,32 +403,31 @@ def api_auto_status():
             'event_name': t['event_name'],
             'record_start': t['record_start'].strftime('%Y-%m-%d %H:%M:%S'),
             'status': t['status'],
-            'fire_time': t.get('fire_time'),
+            'shoot_start': t.get('shoot_start'),
+            'shoot_end': t.get('shoot_end'),
+            'shots': t.get('shots', []),
+            'total_shots': t.get('total_shots', 0),
             'result': t.get('result'),
         } for t in store.auto_tasks]
     return jsonify({'ok': True, 'tasks': tasks})
 
 @app.route('/api/update-token', methods=['POST'])
 def api_update_token():
-    """Обновить токен без перезапуска сервера"""
     data = request.get_json() or {}
     new_token = data.get('token', '').strip()
     if not new_token:
         return jsonify({'ok': False, 'error': 'Пустой токен'}), 400
     
-    # Убираем "Bearer " если есть
     if new_token.startswith('Bearer '):
         new_token = new_token[7:]
     
     HEADERS['Authorization'] = f'Bearer {new_token}'
     
-    # Сразу пробуем загрузить мероприятия
     ok, msg = fetch_events()
     return jsonify({'ok': ok, 'message': msg})
 
 @app.route('/api/status')
 def api_status():
-    """Статус подключения"""
     with store.lock:
         return jsonify({
             'ok': True,
@@ -373,6 +435,11 @@ def api_status():
             'last_update': store.last_update.strftime('%Y-%m-%d %H:%M:%S') if store.last_update else None,
             'last_error': store.last_error,
             'has_token': bool(HEADERS.get('Authorization', '').startswith('Bearer ')),
+            'config': {
+                'pre_start_minutes': PRE_START_MINUTES,
+                'shoot_interval_seconds': SHOOT_INTERVAL_SECONDS,
+                'post_duration_seconds': POST_DURATION_SECONDS,
+            }
         })
 
 # ==================== HTML ====================
@@ -418,6 +485,7 @@ HTML_TEMPLATE = r"""
   .status-red { background: rgba(218,54,51,0.2); color: #f85149; }
   .status-purple { background: rgba(163,113,247,0.2); color: #a371f7; }
   .status-gray { background: rgba(139,148,158,0.2); color: #8b949e; }
+  .status-blue { background: rgba(77,166,255,0.2); color: #4da6ff; }
   .event-name { font-weight: 600; color: #e6e6e6; margin-bottom: 3px; }
   .event-meta { color: #888; font-size: 11px; }
   .fill-bar { display: inline-block; width: 60px; height: 6px; background: #2a3441; border-radius: 3px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
@@ -438,6 +506,11 @@ HTML_TEMPLATE = r"""
   .modal-content h2 { color: #4da6ff; margin-bottom: 16px; }
   .modal-content textarea { width: 100%; min-height: 120px; padding: 10px; background: #0f1419; color: #e6e6e6; border: 1px solid #2a3441; border-radius: 6px; font-family: monospace; font-size: 12px; resize: vertical; }
   .modal-actions { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
+  .shot-list { margin-top: 8px; font-size: 11px; color: #888; }
+  .shot-item { padding: 2px 0; }
+  .shot-ok { color: #3fb950; }
+  .shot-fail { color: #f85149; }
+  .config-info { background: #1a2029; padding: 10px; border-radius: 6px; margin: 10px 0; font-size: 12px; color: #888; }
 </style>
 </head>
 <body>
@@ -521,6 +594,9 @@ HTML_TEMPLATE = r"""
 
 <!-- ВКЛАДКА АВТОЗАПИСЕЙ -->
 <div id="tab-auto" class="hidden">
+  <div class="config-info">
+    <strong>⚙ Настройки стрельбы:</strong> Начинаем за <span id="cfgPreStart">2</span> мин до записи, интервал <span id="cfgInterval">10</span> сек, стреляем ещё <span id="cfgPost">30</span> сек после начала.
+  </div>
   <div class="actions">
     <button class="btn btn-primary" onclick="loadAutoTasks()">🔄 Обновить</button>
   </div>
@@ -529,9 +605,10 @@ HTML_TEMPLATE = r"""
       <tr>
         <th>ID</th>
         <th>Мероприятие</th>
-        <th>Стрельба в</th>
+        <th>Запись в</th>
+        <th>Стрельба</th>
         <th>Статус</th>
-        <th>Выстрел</th>
+        <th>Выстрелы</th>
         <th>Результат</th>
       </tr>
     </thead>
@@ -587,6 +664,13 @@ async function checkStatus() {
     } else {
       bar.className = 'status-bar status-warn';
       bar.textContent = '⚠ Список мероприятий пуст. Нажми "Обновить".';
+    }
+    
+    // Обновляем конфиг
+    if (data.config) {
+      document.getElementById('cfgPreStart').textContent = data.config.pre_start_minutes;
+      document.getElementById('cfgInterval').textContent = data.config.shoot_interval_seconds;
+      document.getElementById('cfgPost').textContent = data.config.post_duration_seconds;
     }
   } catch(e) {
     log('Ошибка проверки статуса: ' + e, 'err');
@@ -723,21 +807,56 @@ async function loadAutoTasks() {
   const body = document.getElementById('autoBody');
   body.innerHTML = '';
   if (data.tasks.length === 0) {
-    body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#888;padding:30px;">Нет запланированных автозаписей</td></tr>';
+    body.innerHTML = '<tr><td colspan="7" style="text-align:center;color:#888;padding:30px;">Нет запланированных автозаписей</td></tr>';
   }
   data.tasks.forEach(t => {
-    const statusColor = {scheduled:'#888',waiting:'#e3b341',firing:'#4da6ff',done:'#3fb950',failed:'#f85149'}[t.status] || '#888';
+    const statusColor = {
+      'scheduled':'#888',
+      'waiting':'#e3b341',
+      'shooting':'#4da6ff',
+      'success':'#3fb950',
+      'failed':'#f85149'
+    }[t.status] || '#888';
+    
+    const statusText = {
+      'scheduled':'⏳ Запланировано',
+      'waiting':'⏰ Ожидание',
+      'shooting':'🔫 Стрельба',
+      'success':'✅ Успех',
+      'failed':'❌ Неудача'
+    }[t.status] || t.status;
+    
     let result = '';
     if (t.result) {
-      result = t.result.ok ? '<span style="color:#3fb950;">✅ OK</span>' : `<span style="color:#f85149;">❌ ${t.result.code||''}</span>`;
+      result = t.result.ok ? '<span style="color:#3fb950;">✅ Успешно</span>' : `<span style="color:#f85149;">❌ Неудача</span>`;
     }
+    
+    let shotsHtml = '';
+    if (t.shots && t.shots.length > 0) {
+      shotsHtml = '<div class="shot-list">';
+      t.shots.slice(-5).forEach(s => {
+        shotsHtml += `<div class="shot-item ${s.ok?'shot-ok':'shot-fail'}">${s.time} - ${s.ok?'✅':'❌'} (${s.code})</div>`;
+      });
+      if (t.shots.length > 5) {
+        shotsHtml += `<div class="shot-item" style="color:#888;">...и ещё ${t.shots.length - 5}</div>`;
+      }
+      shotsHtml += '</div>';
+    }
+    
     body.innerHTML += `
       <tr>
         <td style="font-family:monospace;color:#888;">${t.event_id}</td>
         <td>${t.event_name}</td>
         <td>${t.record_start}</td>
-        <td><span style="color:${statusColor};font-weight:600;">${t.status}</span></td>
-        <td>${t.fire_time || '—'}</td>
+        <td style="font-size:11px;color:#888;">
+          ${t.shoot_start ? 'с '+t.shoot_start : '—'}<br>
+          ${t.shoot_end ? 'до '+t.shoot_end : ''}
+        </td>
+        <td><span style="color:${statusColor};font-weight:600;">${statusText}</span></td>
+        <td>
+          <div style="font-size:12px;">Всего: <b>${t.total_shots || 0}</b></div>
+          ${shotsHtml}
+        </td>
         <td>${result}</td>
       </tr>
     `;
@@ -755,9 +874,7 @@ async function updateAutoCount() {
 function showTokenModal() {
   document.getElementById('tokenModal').classList.add('show');
   document.getElementById('tokenResult').textContent = '';
-  // Подставляем текущий токен (без Bearer)
   fetch('/api/status').then(r=>r.json()).then(d=>{
-    // Токен не отдаём для безопасности, просто очищаем поле
     document.getElementById('tokenInput').value = '';
     document.getElementById('tokenInput').focus();
   });
@@ -810,7 +927,7 @@ document.querySelectorAll('.tab').forEach(tab => {
 });
 
 setInterval(loadEvents, 15000);
-setInterval(updateAutoCount, 5000);
+setInterval(updateAutoCount, 3000);
 setInterval(checkStatus, 10000);
 
 // Старт
@@ -829,6 +946,11 @@ if __name__ == '__main__':
     print("=" * 60)
     print("🚀 Sirius Auto-Record Web")
     print("=" * 60)
+    print(f"⚙ Настройки стрельбы:")
+    print(f"   - Начинаем за {PRE_START_MINUTES} мин до записи")
+    print(f"   - Интервал между запросами: {SHOOT_INTERVAL_SECONDS} сек")
+    print(f"   - Стреляем ещё {POST_DURATION_SECONDS} сек после начала")
+    print()
     print("Загружаю мероприятия...")
     ok, msg = fetch_events()
     print(f"  {msg}")
