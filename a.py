@@ -31,7 +31,8 @@ class Store:
     def __init__(self):
         self.events = []
         self.last_update = None
-        self.auto_tasks = []  # {event_id, event_name, record_start, status, result, thread}
+        self.last_error = None
+        self.auto_tasks = []
         self.lock = threading.Lock()
 
 store = Store()
@@ -79,10 +80,34 @@ def fetch_events():
     session.headers.update(HEADERS)
     try:
         r = session.get(f"{BASE_URL}/record", timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get('success'):
-            return False, "API error"
+        
+        # Детальная обработка ошибок
+        if r.status_code == 401:
+            store.last_error = "❌ ОШИБКА 401: Токен истёк или невалидный. Обнови токен в настройках!"
+            return False, store.last_error
+        if r.status_code == 403:
+            store.last_error = "❌ ОШИБКА 403: Доступ запрещён"
+            return False, store.last_error
+        if r.status_code >= 400:
+            store.last_error = f"❌ HTTP {r.status_code}: {r.text[:200]}"
+            return False, store.last_error
+        
+        # Проверяем, что ответ JSON
+        try:
+            data = r.json()
+        except Exception as e:
+            store.last_error = f"❌ Ответ не JSON: {r.text[:200]}"
+            return False, store.last_error
+        
+        # Проверяем структуру ответа
+        if 'success' not in data:
+            store.last_error = f"❌ Нет поля 'success' в ответе. Ключи: {list(data.keys())}"
+            return False, store.last_error
+        
+        if not data['success']:
+            store.last_error = "⚠ Поле 'success' пустое — мероприятий нет"
+            return False, store.last_error
+        
         events = []
         for day in data['success']:
             day_iso = day.get('dayISO', '')
@@ -97,11 +122,21 @@ def fetch_events():
                 ev['_status_text'] = status_text
                 ev['_status_color'] = status_color
                 events.append(ev)
+        
         with store.lock:
             store.events = events
             store.last_update = datetime.now(MSK_TZ)
-        return True, f"Загружено {len(events)} мероприятий"
+            store.last_error = None
+        
+        return True, f"✅ Загружено {len(events)} мероприятий"
+    except requests.exceptions.Timeout:
+        store.last_error = "❌ Таймаут соединения с сервером"
+        return False, store.last_error
+    except requests.exceptions.ConnectionError as e:
+        store.last_error = f"❌ Ошибка соединения: {str(e)[:100]}"
+        return False, store.last_error
     except Exception as e:
+        store.last_error = f"❌ Неизвестная ошибка: {str(e)}"
         return False, str(e)
 
 def subscribe_event(event_id):
@@ -133,7 +168,6 @@ def auto_record_worker(task):
             if t['event_id'] == event_id and t['thread'] == threading.current_thread():
                 t['status'] = 'waiting'
 
-    # Ждём до 1 сек до цели
     while True:
         now = datetime.now(MSK_TZ)
         delta = (target - now).total_seconds()
@@ -142,7 +176,6 @@ def auto_record_worker(task):
         else:
             break
 
-    # Busy-wait последние 50мс
     while datetime.now(MSK_TZ) < target:
         pass
 
@@ -154,7 +187,6 @@ def auto_record_worker(task):
 
     ok, code, resp = subscribe_event(event_id)
 
-    # Retry
     if not ok:
         for retry in range(2):
             time.sleep(0.1)
@@ -175,8 +207,7 @@ def index():
 
 @app.route('/api/events')
 def api_events():
-    # Фильтры
-    date_filter = request.args.get('date', 'all')  # today / tomorrow / all / YYYY-MM-DD
+    date_filter = request.args.get('date', 'all')
     status_filter = request.args.get('status', 'all')
     only_bookable = request.args.get('bookable', 'false') == 'true'
     search = request.args.get('search', '').strip().lower()
@@ -184,6 +215,7 @@ def api_events():
     with store.lock:
         events = list(store.events)
         last_update = store.last_update
+        last_error = store.last_error
 
     now = datetime.now(MSK_TZ)
     today = now.date()
@@ -191,7 +223,6 @@ def api_events():
 
     filtered = []
     for ev in events:
-        # Дата
         if date_filter == 'today':
             if not ev.get('eventStart_msk') or ev['eventStart_msk'].date() != today:
                 continue
@@ -206,24 +237,19 @@ def api_events():
             except:
                 pass
 
-        # Статус
         if status_filter != 'all' and ev['_status_key'] != status_filter:
             continue
 
-        # Только доступные
         if only_bookable and ev['_status_key'] not in ('available', 'reserved'):
             continue
 
-        # Поиск
         if search and search not in ev.get('eventName', '').lower():
             continue
 
         filtered.append(ev)
 
-    # Сортировка: по дате мероприятия
     filtered.sort(key=lambda e: e.get('eventStart_msk') or datetime.max.replace(tzinfo=MSK_TZ))
 
-    # Формат для фронта
     result = []
     for ev in filtered:
         result.append({
@@ -249,6 +275,7 @@ def api_events():
         'ok': True,
         'count': len(result),
         'last_update': last_update.strftime('%H:%M:%S') if last_update else None,
+        'last_error': last_error,
         'server_time': now.strftime('%Y-%m-%d %H:%M:%S'),
         'events': result
     })
@@ -318,13 +345,35 @@ def api_auto_status():
         } for t in store.auto_tasks]
     return jsonify({'ok': True, 'tasks': tasks})
 
-@app.route('/api/dates')
-def api_dates():
-    """Список доступных дат для фильтра"""
+@app.route('/api/update-token', methods=['POST'])
+def api_update_token():
+    """Обновить токен без перезапуска сервера"""
+    data = request.get_json() or {}
+    new_token = data.get('token', '').strip()
+    if not new_token:
+        return jsonify({'ok': False, 'error': 'Пустой токен'}), 400
+    
+    # Убираем "Bearer " если есть
+    if new_token.startswith('Bearer '):
+        new_token = new_token[7:]
+    
+    HEADERS['Authorization'] = f'Bearer {new_token}'
+    
+    # Сразу пробуем загрузить мероприятия
+    ok, msg = fetch_events()
+    return jsonify({'ok': ok, 'message': msg})
+
+@app.route('/api/status')
+def api_status():
+    """Статус подключения"""
     with store.lock:
-        events = store.events
-    dates = sorted(set(e['dayISO'] for e in events if e.get('dayISO')))
-    return jsonify({'dates': dates})
+        return jsonify({
+            'ok': True,
+            'events_count': len(store.events),
+            'last_update': store.last_update.strftime('%Y-%m-%d %H:%M:%S') if store.last_update else None,
+            'last_error': store.last_error,
+            'has_token': bool(HEADERS.get('Authorization', '').startswith('Bearer ')),
+        })
 
 # ==================== HTML ====================
 HTML_TEMPLATE = r"""
@@ -339,6 +388,10 @@ HTML_TEMPLATE = r"""
   h1 { color: #4da6ff; margin-bottom: 12px; }
   .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; flex-wrap: wrap; gap: 10px; }
   .meta { color: #888; font-size: 13px; }
+  .status-bar { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; }
+  .status-ok { background: rgba(46,160,67,0.15); color: #3fb950; border: 1px solid #2ea043; }
+  .status-error { background: rgba(218,54,51,0.15); color: #f85149; border: 1px solid #da3633; }
+  .status-warn { background: rgba(210,153,34,0.15); color: #e3b341; border: 1px solid #d29922; }
   .filters { background: #1a2029; padding: 14px; border-radius: 10px; margin-bottom: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
   .filters label { display: block; font-size: 12px; color: #888; margin-bottom: 4px; }
   .filters input, .filters select { width: 100%; padding: 8px; background: #0f1419; color: #e6e6e6; border: 1px solid #2a3441; border-radius: 6px; font-size: 14px; }
@@ -370,7 +423,6 @@ HTML_TEMPLATE = r"""
   .fill-bar { display: inline-block; width: 60px; height: 6px; background: #2a3441; border-radius: 3px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
   .fill-bar > div { height: 100%; }
   .checkbox { width: 16px; height: 16px; cursor: pointer; }
-  .selected-bar { position: sticky; bottom: 0; background: #242d38; padding: 12px; border-radius: 10px; margin-top: 12px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 -4px 20px rgba(0,0,0,0.5); }
   .log { background: #0a0d12; border: 1px solid #2a3441; border-radius: 8px; padding: 10px; margin-top: 12px; max-height: 200px; overflow-y: auto; font-family: monospace; font-size: 12px; }
   .log-entry { padding: 3px 0; border-bottom: 1px dashed #2a3441; }
   .log-ok { color: #3fb950; }
@@ -380,14 +432,25 @@ HTML_TEMPLATE = r"""
   .tab { padding: 8px 14px; cursor: pointer; border-bottom: 2px solid transparent; color: #888; font-size: 13px; }
   .tab.active { color: #4da6ff; border-bottom-color: #4da6ff; }
   .hidden { display: none; }
+  .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center; align-items: center; }
+  .modal.show { display: flex; }
+  .modal-content { background: #1a2029; padding: 24px; border-radius: 12px; max-width: 600px; width: 90%; }
+  .modal-content h2 { color: #4da6ff; margin-bottom: 16px; }
+  .modal-content textarea { width: 100%; min-height: 120px; padding: 10px; background: #0f1419; color: #e6e6e6; border: 1px solid #2a3441; border-radius: 6px; font-family: monospace; font-size: 12px; resize: vertical; }
+  .modal-actions { display: flex; gap: 8px; margin-top: 16px; justify-content: flex-end; }
 </style>
 </head>
 <body>
 
 <div class="header">
   <h1>🎯 Sirius Auto-Record</h1>
-  <div class="meta" id="serverTime">—</div>
+  <div style="display:flex;gap:8px;align-items:center;">
+    <button class="btn btn-warn" onclick="showTokenModal()">🔑 Токен</button>
+    <div class="meta" id="serverTime">—</div>
+  </div>
 </div>
+
+<div id="statusBar" class="status-bar status-warn">⏳ Загрузка статуса...</div>
 
 <div class="tabs">
   <div class="tab active" data-tab="events">Мероприятия</div>
@@ -460,7 +523,6 @@ HTML_TEMPLATE = r"""
 <div id="tab-auto" class="hidden">
   <div class="actions">
     <button class="btn btn-primary" onclick="loadAutoTasks()">🔄 Обновить</button>
-    <button class="btn btn-danger" onclick="clearAutoTasks()">🗑 Очистить завершённые</button>
   </div>
   <table>
     <thead>
@@ -479,6 +541,23 @@ HTML_TEMPLATE = r"""
 
 <div class="log" id="log"></div>
 
+<!-- МОДАЛКА ТОКЕНА -->
+<div id="tokenModal" class="modal">
+  <div class="modal-content">
+    <h2>🔑 Обновить токен</h2>
+    <p style="color:#888;font-size:13px;margin-bottom:12px;">
+      Вставь новый Bearer токен из DevTools (Network → любой запрос к API → Headers → Authorization).
+      Можно вставлять как с "Bearer ", так и без.
+    </p>
+    <textarea id="tokenInput" placeholder="eyJhbGciOiJQUzUxMiJ9..."></textarea>
+    <div class="modal-actions">
+      <button class="btn" style="background:#2a3441;color:#e6e6e6;" onclick="hideTokenModal()">Отмена</button>
+      <button class="btn btn-success" onclick="updateToken()">💾 Сохранить и проверить</button>
+    </div>
+    <div id="tokenResult" style="margin-top:12px;font-size:13px;"></div>
+  </div>
+</div>
+
 <script>
 const selected = new Set();
 let allEvents = [];
@@ -493,9 +572,33 @@ function log(msg, type='info') {
   if (el.children.length > 100) el.removeChild(el.lastChild);
 }
 
+async function checkStatus() {
+  try {
+    const r = await fetch('/api/status');
+    const data = await r.json();
+    const bar = document.getElementById('statusBar');
+    
+    if (data.last_error) {
+      bar.className = 'status-bar status-error';
+      bar.textContent = data.last_error;
+    } else if (data.events_count > 0) {
+      bar.className = 'status-bar status-ok';
+      bar.textContent = `✅ Подключено. Загружено мероприятий: ${data.events_count}. Обновлено: ${data.last_update || '—'}`;
+    } else {
+      bar.className = 'status-bar status-warn';
+      bar.textContent = '⚠ Список мероприятий пуст. Нажми "Обновить".';
+    }
+  } catch(e) {
+    log('Ошибка проверки статуса: ' + e, 'err');
+  }
+}
+
 async function refreshEvents() {
   log('Обновление списка...');
-  await fetch('/api/refresh', {method:'POST'});
+  const r = await fetch('/api/refresh', {method:'POST'});
+  const data = await r.json();
+  log(data.message, data.ok ? 'ok' : 'err');
+  await checkStatus();
   await loadEvents();
 }
 
@@ -508,7 +611,7 @@ async function loadEvents() {
   });
   const r = await fetch('/api/events?' + params);
   const data = await r.json();
-  document.getElementById('serverTime').textContent = `Сервер: ${data.server_time} | Обновлено: ${data.last_update || '—'}`;
+  document.getElementById('serverTime').textContent = `Сервер: ${data.server_time}`;
   allEvents = data.events;
   renderEvents(data);
 }
@@ -518,7 +621,6 @@ function renderEvents(data) {
   body.innerHTML = '';
   const stats = document.getElementById('stats');
 
-  // Считаем статусы
   const counts = {};
   data.events.forEach(e => counts[e.status_key] = (counts[e.status_key]||0)+1);
   stats.innerHTML = `
@@ -530,6 +632,11 @@ function renderEvents(data) {
     <span class="chip" style="color:#f85149;">❌ Мест нет: ${counts.noSpace||0}</span>
     <span class="chip" style="color:#a371f7;">⚠ Конфликт: ${counts.conflict||0}</span>
   `;
+
+  if (data.events.length === 0) {
+    body.innerHTML = '<tr><td colspan="8" style="text-align:center;color:#888;padding:30px;">Нет мероприятий по заданным фильтрам</td></tr>';
+    return;
+  }
 
   data.events.forEach(ev => {
     const tr = document.createElement('tr');
@@ -563,7 +670,6 @@ function renderEvents(data) {
     body.appendChild(tr);
   });
 
-  // Обработчики чекбоксов
   body.querySelectorAll('.checkbox').forEach(cb => {
     cb.addEventListener('change', e => {
       const id = e.target.dataset.id;
@@ -616,6 +722,9 @@ async function loadAutoTasks() {
   const data = await r.json();
   const body = document.getElementById('autoBody');
   body.innerHTML = '';
+  if (data.tasks.length === 0) {
+    body.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#888;padding:30px;">Нет запланированных автозаписей</td></tr>';
+  }
   data.tasks.forEach(t => {
     const statusColor = {scheduled:'#888',waiting:'#e3b341',firing:'#4da6ff',done:'#3fb950',failed:'#f85149'}[t.status] || '#888';
     let result = '';
@@ -636,15 +745,52 @@ async function loadAutoTasks() {
   document.getElementById('autoCount').textContent = data.tasks.length;
 }
 
-async function clearAutoTasks() {
-  // На бэкенде нет эндпоинта, просто перезагрузим
-  log('Очистка на стороне сервера не реализована — перезапустите сервер', 'info');
-}
-
 async function updateAutoCount() {
   const r = await fetch('/api/auto-record/status');
   const data = await r.json();
   document.getElementById('autoCount').textContent = data.tasks.length;
+}
+
+// МОДАЛКА ТОКЕНА
+function showTokenModal() {
+  document.getElementById('tokenModal').classList.add('show');
+  document.getElementById('tokenResult').textContent = '';
+  // Подставляем текущий токен (без Bearer)
+  fetch('/api/status').then(r=>r.json()).then(d=>{
+    // Токен не отдаём для безопасности, просто очищаем поле
+    document.getElementById('tokenInput').value = '';
+    document.getElementById('tokenInput').focus();
+  });
+}
+
+function hideTokenModal() {
+  document.getElementById('tokenModal').classList.remove('show');
+}
+
+async function updateToken() {
+  const token = document.getElementById('tokenInput').value.trim();
+  const result = document.getElementById('tokenResult');
+  if (!token) {
+    result.innerHTML = '<span style="color:#f85149;">❌ Вставь токен</span>';
+    return;
+  }
+  result.innerHTML = '<span style="color:#e3b341;">⏳ Проверяю...</span>';
+  const r = await fetch('/api/update-token', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: token})
+  });
+  const data = await r.json();
+  if (data.ok) {
+    result.innerHTML = `<span style="color:#3fb950;">✅ ${data.message}</span>`;
+    setTimeout(() => {
+      hideTokenModal();
+      checkStatus();
+      loadEvents();
+    }, 1000);
+  } else {
+    result.innerHTML = `<span style="color:#f85149;">❌ ${data.message}</span>`;
+  }
 }
 
 // Табы
@@ -658,17 +804,17 @@ document.querySelectorAll('.tab').forEach(tab => {
   });
 });
 
-// Фильтры — автообновление
 ['search','dateFilter','statusFilter','bookableOnly'].forEach(id => {
   document.getElementById(id).addEventListener('input', loadEvents);
   document.getElementById(id).addEventListener('change', loadEvents);
 });
 
-// Автообновление
 setInterval(loadEvents, 15000);
 setInterval(updateAutoCount, 5000);
+setInterval(checkStatus, 10000);
 
 // Старт
+checkStatus();
 loadEvents();
 updateAutoCount();
 log('Интерфейс загружен', 'ok');
