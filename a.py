@@ -30,11 +30,15 @@ MSK_TZ = timezone(timedelta(hours=3))
 # За сколько минут до recordStart начинать стрелять
 PRE_START_MINUTES = 2
 
-# Интервал между запросами (в секундах)
-SHOOT_INTERVAL_SECONDS = 10
+# Интервал между запросами ДО открытия записи (в секундах)
+PRE_SHOOT_INTERVAL_SECONDS = 10
 
-# Сколько секунд продолжать стрелять ПОСЛЕ recordStart
-POST_DURATION_SECONDS = 30
+# Количество запросов в 10 секунд ПОСЛЕ открытия записи
+POST_SHOTS_PER_WINDOW = 3
+
+# Сколько минут продолжать стрелять ПОСЛЕ recordStart (даже если нет ответа)
+POST_DURATION_MINUTES = 8
+POST_DURATION_SECONDS = POST_DURATION_MINUTES * 60
 
 # ==================== ХРАНИЛИЩЕ ====================
 class Store:
@@ -168,9 +172,9 @@ def subscribe_event(event_id):
 def auto_record_worker(task):
     """
     Рабочий поток для автозаписи.
-    Начинает стрелять за PRE_START_MINUTES до recordStart,
-    продолжает каждые SHOOT_INTERVAL_SECONDS секунд,
-    и ещё POST_DURATION_SECONDS секунд после recordStart.
+    - За 2 минуты до recordStart: 1 запрос каждые 10 секунд.
+    - После recordStart: 3 запроса каждые 10 секунд (пачкой).
+    - Стоп через 8 минут после recordStart.
     """
     event_id = task['event_id']
     target = task['record_start']
@@ -204,6 +208,7 @@ def auto_record_worker(task):
     
     shot_count = 0
     success = False
+    last_resp = None
     
     # Стреляем циклом
     while True:
@@ -211,33 +216,74 @@ def auto_record_worker(task):
         if now > shoot_end:
             break
         
-        # Делаем выстрел
-        shot_count += 1
-        timestamp = now.strftime('%H:%M:%S.%f')[:-3]
-        
-        ok, code, resp = subscribe_event(event_id)
-        
-        with store.lock:
-            for t in store.auto_tasks:
-                if t['event_id'] == event_id and t['thread'] == threading.current_thread():
-                    t['shots'].append({
-                        'time': timestamp,
-                        'ok': ok,
-                        'code': code,
-                    })
-                    if ok:
-                        success = True
-        
-        # Если успешно — останавливаемся
-        if success:
+        if now < target:
+            # === ФАЗА 1: ДО ОТКРЫТИЯ ЗАПИСИ ===
+            # 1 запрос в 10 секунд
+            shot_count += 1
+            timestamp = now.strftime('%H:%M:%S.%f')[:-3]
+            
+            ok, code, resp = subscribe_event(event_id)
+            last_resp = resp
+            
             with store.lock:
                 for t in store.auto_tasks:
                     if t['event_id'] == event_id and t['thread'] == threading.current_thread():
-                        t['status'] = 'success'
-            break
-        
-        # Ждём интервал перед следующим выстрелом
-        time.sleep(SHOOT_INTERVAL_SECONDS)
+                        t['shots'].append({
+                            'time': timestamp,
+                            'ok': ok,
+                            'code': code,
+                        })
+                        if ok:
+                            success = True
+            
+            # Если успешно — останавливаемся
+            if success:
+                break
+            
+            # Ждём интервал перед следующим выстрелом
+            time.sleep(PRE_SHOOT_INTERVAL_SECONDS)
+        else:
+            # === ФАЗА 2: ПОСЛЕ ОТКРЫТИЯ ЗАПИСИ ===
+            # 3 запроса в 10 секунд (пачкой)
+            window_start = time.time()
+            
+            for i in range(POST_SHOTS_PER_WINDOW):
+                now = datetime.now(MSK_TZ)
+                if now > shoot_end:
+                    break
+                
+                shot_count += 1
+                timestamp = now.strftime('%H:%M:%S.%f')[:-3]
+                
+                ok, code, resp = subscribe_event(event_id)
+                last_resp = resp
+                
+                with store.lock:
+                    for t in store.auto_tasks:
+                        if t['event_id'] == event_id and t['thread'] == threading.current_thread():
+                            t['shots'].append({
+                                'time': timestamp,
+                                'ok': ok,
+                                'code': code,
+                            })
+                            if ok:
+                                success = True
+                
+                # Если успешно — останавливаемся
+                if success:
+                    break
+                
+                # Небольшая задержка между запросами в пачке, чтобы не слать абсолютно одновременно
+                if i < POST_SHOTS_PER_WINDOW - 1:
+                    time.sleep(0.2)
+            
+            # Если успешно — останавливаемся
+            if success:
+                break
+            
+            # Ждём остаток 10-секундного окна
+            elapsed = time.time() - window_start
+            time.sleep(max(0, 10 - elapsed))
     
     # Финальный статус
     with store.lock:
@@ -249,7 +295,7 @@ def auto_record_worker(task):
                 t['result'] = {
                     'ok': success,
                     'shots': shot_count,
-                    'last_response': resp if not success else None
+                    'last_response': last_resp if not success else None
                 }
 
 # ==================== API ====================
@@ -437,7 +483,8 @@ def api_status():
             'has_token': bool(HEADERS.get('Authorization', '').startswith('Bearer ')),
             'config': {
                 'pre_start_minutes': PRE_START_MINUTES,
-                'shoot_interval_seconds': SHOOT_INTERVAL_SECONDS,
+                'pre_shoot_interval_seconds': PRE_SHOOT_INTERVAL_SECONDS,
+                'post_shots_per_window': POST_SHOTS_PER_WINDOW,
                 'post_duration_seconds': POST_DURATION_SECONDS,
             }
         })
@@ -595,7 +642,10 @@ HTML_TEMPLATE = r"""
 <!-- ВКЛАДКА АВТОЗАПИСЕЙ -->
 <div id="tab-auto" class="hidden">
   <div class="config-info">
-    <strong>⚙ Настройки стрельбы:</strong> Начинаем за <span id="cfgPreStart">2</span> мин до записи, интервал <span id="cfgInterval">10</span> сек, стреляем ещё <span id="cfgPost">30</span> сек после начала.
+    <strong>⚙ Настройки стрельбы:</strong> 
+    За <span id="cfgPreStart">2</span> мин до записи: 1 запрос в <span id="cfgPreInterval">10</span> сек. 
+    После открытия: <span id="cfgPostShots">3</span> запроса в 10 сек. 
+    Стоп через <span id="cfgPostDuration">8</span> мин.
   </div>
   <div class="actions">
     <button class="btn btn-primary" onclick="loadAutoTasks()">🔄 Обновить</button>
@@ -669,8 +719,9 @@ async function checkStatus() {
     // Обновляем конфиг
     if (data.config) {
       document.getElementById('cfgPreStart').textContent = data.config.pre_start_minutes;
-      document.getElementById('cfgInterval').textContent = data.config.shoot_interval_seconds;
-      document.getElementById('cfgPost').textContent = data.config.post_duration_seconds;
+      document.getElementById('cfgPreInterval').textContent = data.config.pre_shoot_interval_seconds;
+      document.getElementById('cfgPostShots').textContent = data.config.post_shots_per_window;
+      document.getElementById('cfgPostDuration').textContent = data.config.post_duration_seconds / 60;
     }
   } catch(e) {
     log('Ошибка проверки статуса: ' + e, 'err');
@@ -947,9 +998,9 @@ if __name__ == '__main__':
     print("🚀 Sirius Auto-Record Web")
     print("=" * 60)
     print(f"⚙ Настройки стрельбы:")
-    print(f"   - Начинаем за {PRE_START_MINUTES} мин до записи")
-    print(f"   - Интервал между запросами: {SHOOT_INTERVAL_SECONDS} сек")
-    print(f"   - Стреляем ещё {POST_DURATION_SECONDS} сек после начала")
+    print(f"   - За {PRE_START_MINUTES} мин до записи: 1 запрос в {PRE_SHOOT_INTERVAL_SECONDS} сек")
+    print(f"   - После открытия: {POST_SHOTS_PER_WINDOW} запроса в 10 сек (пачкой)")
+    print(f"   - Стоп через {POST_DURATION_MINUTES} мин после открытия")
     print()
     print("Загружаю мероприятия...")
     ok, msg = fetch_events()
